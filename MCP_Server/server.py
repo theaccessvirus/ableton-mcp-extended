@@ -3,6 +3,7 @@ from mcp.server.fastmcp import FastMCP, Context
 import socket
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -115,7 +116,7 @@ class AbletonConnection:
             "duplicate_to_arrangement", "delete_arrangement_clip",
             "set_arrangement_clip_property",
             "set_view", "control_arrangement_view",
-            "manage_clip_automation",
+            "manage_clip_automation", "fade_clip_edges",
             "add_notes_to_arrangement_clip",
             "set_device_parameter", "set_device_enabled",
             "delete_device", "navigate_preset",
@@ -1670,6 +1671,46 @@ def manage_clip_automation(
         return f"Error managing clip automation: {str(e)}"
 
 
+@mcp.tool()
+def fade_clip_edges(
+    ctx: Context,
+    track_index: int = 0,
+    clip_index: int = 0,
+    fade_ms: float = 1.0,
+    steps: int = 6,
+    action: str = "apply",
+) -> str:
+    """Add a minimal volume-envelope fade to the start and end of audio clips.
+
+    Writes a clip Mixer-Volume automation envelope that ramps from silence up to
+    the track's current volume over `fade_ms`, holds, then ramps back to silence
+    over `fade_ms` at the clip end - a programmatic short declick fade (Logic-style
+    "just engaged"). Operates on audio clips only; MIDI clips are skipped.
+
+    Parameters:
+    - track_index: Track number (1-based). 0 = the currently selected track.
+    - clip_index: Clip position (1-based). 0 = every audio clip on the track.
+    - fade_ms: Fade length in milliseconds (default 1.0).
+    - steps: Ramp resolution - breakpoints per fade (default 6).
+    - action: "apply", "inspect" (read-only) or "clear".
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = (track_index - 1) if track_index > 0 else -1
+        ci = (clip_index - 1) if clip_index > 0 else -1
+        result = ableton.send_command("fade_clip_edges", {
+            "track_index": ti,
+            "clip_index": ci,
+            "fade_ms": fade_ms,
+            "steps": steps,
+            "action": action,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error fading clip edges: {str(e)}")
+        return f"Error fading clip edges: {str(e)}"
+
+
 # ── Device / Parameter Tools ──────────────────────────────────────
 
 @mcp.tool()
@@ -2168,6 +2209,178 @@ def navigate_device_preset(
     except Exception as e:
         logger.error(f"Error navigating preset: {str(e)}")
         return f"Error navigating preset: {str(e)}"
+
+
+# ─── Vendored AbletonExporter tools ────────────────────────────────────────
+# Audio export, .als parsing, and Ableton path detection. Source files live in
+# MCP_Server/exporter/. Imports are deferred so the server still starts on
+# platforms without pyobjc-framework-Quartz (export_automation is macOS-only).
+
+@mcp.tool()
+def export_song(
+    ctx: Context,
+    output_dir: str = "~/Desktop",
+    filename: str = "export",
+    wait_for_completion: bool = True,
+    pcm: bool = True,
+    sample_rate: str = None,
+    bit_depth: str = None,
+) -> str:
+    """
+    Export the currently open Ableton session to an audio file (macOS only).
+
+    Drives Ableton's Export Audio/Video dialog via the macOS Accessibility API
+    without stealing focus, then locates the rendered file and moves it to
+    output_dir. Requires Accessibility permission for the process running this
+    server (System Settings → Privacy & Security → Accessibility) and the
+    'exporter' extra installed (pip install -e '.[exporter]').
+
+    Parameters:
+    - output_dir: Folder to move the rendered file into (default ~/Desktop)
+    - filename: Base filename for the output (extension added by Ableton)
+    - wait_for_completion: Block until render finishes and file is moved
+    - pcm: Toggle "Encode PCM" in the export dialog
+    - sample_rate: e.g. "44100", "48000", "96000" (matches dropdown label)
+    - bit_depth: e.g. "16", "24", "32" (only used when pcm=True)
+    """
+    try:
+        from MCP_Server.exporter import export_automation
+    except ImportError as e:
+        return ("Export requires macOS with pyobjc-framework-Quartz installed. "
+                "Install with: pip install -e '.[exporter]'  "
+                f"(import error: {e})")
+    try:
+        result = export_automation.export_song(
+            output_dir=output_dir,
+            filename=filename,
+            wait_for_completion=wait_for_completion,
+            pcm=pcm,
+            sample_rate=sample_rate,
+            bit_depth=bit_depth,
+        )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error exporting song: {str(e)}")
+        return f"Error exporting song: {str(e)}"
+
+
+@mcp.tool()
+def parse_als_file(ctx: Context, als_path: str) -> str:
+    """
+    Read tempo, time signature, beats, and duration directly from an .als
+    project file (gzipped XML) without opening Ableton.
+
+    Parameters:
+    - als_path: Path to the .als file (~ is expanded)
+    """
+    try:
+        from MCP_Server.exporter import als_parser
+        result = als_parser.parse_duration(os.path.expanduser(als_path))
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error parsing ALS file: {str(e)}")
+        return f"Error parsing ALS file: {str(e)}"
+
+
+@mcp.tool()
+def get_ableton_paths(ctx: Context) -> str:
+    """
+    Auto-detect Ableton's User Library, Remote Scripts folder, and installed
+    Live version by reading Library.cfg. Handles Dropbox/iCloud-synced
+    libraries. macOS only.
+    """
+    try:
+        from MCP_Server.exporter import ableton_paths
+        user_lib = ableton_paths.get_user_library_path()
+        remote_scripts = ableton_paths.get_remote_scripts_path()
+        version = ableton_paths.get_ableton_version()
+        return json.dumps({
+            "user_library": str(user_lib) if user_lib else None,
+            "remote_scripts": str(remote_scripts) if remote_scripts else None,
+            "live_version": version,
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error detecting Ableton paths: {str(e)}")
+        return f"Error detecting Ableton paths: {str(e)}"
+
+
+# ─── max-http-bridge save + bounce tools ───────────────────────────────────
+# Save-as via keystroke automation + bounce-in-place via the bridge's
+# /bounce/workflow endpoint. Lives in MCP_Server/bridge/.
+
+@mcp.tool()
+def save_project_as(ctx: Context, folder: str, name: str,
+                    dialog_timeout: float = 15.0) -> str:
+    """
+    Save the current Ableton project to <folder>/<name> Project/<name>.als via
+    Cmd+Shift+S keystroke automation. Ableton stays in the background
+    (CGEventPostToPid). macOS only.
+
+    Parameters:
+    - folder: Destination folder (~ expanded; created if missing)
+    - name: Project name (with or without .als suffix)
+    - dialog_timeout: Seconds to wait for the save dialog to appear
+    """
+    try:
+        from MCP_Server.bridge.save_project_as import save_project_as as _save
+        result = _save(folder=folder, name=name, dialog_timeout=dialog_timeout)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error in save_project_as: {str(e)}")
+        return f"Error in save_project_as: {str(e)}"
+
+
+@mcp.tool()
+def bounce_via_bridge(ctx: Context, project_dir: str = None,
+                      bounce_wait_ms: int = 5000,
+                      bridge_url: str = "http://127.0.0.1:7500") -> str:
+    """
+    Trigger an Ableton bounce-in-place via the max-http-bridge
+    /bounce/workflow endpoint, then move the resulting .wav into the project
+    root as <song>.als.wav. Requires the HTTPBridge.amxd loaded on the Master
+    track and listening on the given URL.
+
+    Parameters:
+    - project_dir: Folder containing the .als + Samples/. If omitted, the
+      file-move step is skipped and the bridge response is returned as-is.
+    - bounce_wait_ms: Forwarded to the bridge (post-keystroke wait)
+    - bridge_url: HTTPBridge base URL
+    """
+    try:
+        from MCP_Server.bridge.bounce_via_bridge import bounce_via_bridge as _bounce
+        result = _bounce(project_dir=project_dir, bounce_wait_ms=bounce_wait_ms,
+                         bridge_url=bridge_url)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error in bounce_via_bridge: {str(e)}")
+        return f"Error in bounce_via_bridge: {str(e)}"
+
+
+@mcp.tool()
+def save_and_bounce(ctx: Context, folder: str, name: str,
+                    bounce_wait_ms: int = 5000,
+                    dialog_timeout: float = 15.0,
+                    bridge_url: str = "http://127.0.0.1:7500") -> str:
+    """
+    Save the current Ableton project to <folder>/<name> and then bounce it via
+    the max-http-bridge, landing the rendered audio at
+    <folder>/<name> Project/<name>.als.wav. macOS only. Requires HTTPBridge
+    loaded on Master.
+
+    Parameters:
+    - folder, name: forwarded to save_project_as
+    - bounce_wait_ms: forwarded to bounce_via_bridge
+    - dialog_timeout: save dialog appearance timeout
+    - bridge_url: HTTPBridge base URL
+    """
+    try:
+        from MCP_Server.bridge.save_and_bounce import save_and_bounce as _sab
+        result = _sab(folder=folder, name=name, bounce_wait_ms=bounce_wait_ms,
+                      dialog_timeout=dialog_timeout, bridge_url=bridge_url)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error in save_and_bounce: {str(e)}")
+        return f"Error in save_and_bounce: {str(e)}"
 
 
 # Main execution

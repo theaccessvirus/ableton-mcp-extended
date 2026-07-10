@@ -237,6 +237,7 @@ class AbletonMCP(ControlSurface):
                                  "set_arrangement_clip_property",
                                  "set_view", "control_arrangement_view",
                                  "manage_clip_automation",
+                                 "fade_clip_edges",
                                  "add_notes_to_arrangement_clip",
                                  "set_device_parameter", "set_device_enabled",
                                  "delete_device", "navigate_preset",
@@ -352,6 +353,13 @@ class AbletonMCP(ControlSurface):
                             action = params.get("action", "create")
                             pn = params.get("parameter_name", "")
                             result = self._manage_clip_automation(ti, ci, action, pn)
+                        elif command_type == "fade_clip_edges":
+                            ti = params.get("track_index", -1)
+                            ci = params.get("clip_index", -1)
+                            fade_ms = params.get("fade_ms", 1.0)
+                            steps = params.get("steps", 6)
+                            action = params.get("action", "apply")
+                            result = self._fade_clip_edges(ti, ci, fade_ms, steps, action)
                         elif command_type == "add_notes_to_arrangement_clip":
                             ti = params.get("track_index", 0)
                             ci = params.get("clip_index", 0)
@@ -1503,6 +1511,104 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error managing clip automation: " + str(e))
             raise
+
+    def _fade_clip_edges(self, track_index=-1, clip_index=-1, fade_ms=1.0, steps=6, action="apply"):
+        """Insert a minimal volume-envelope fade at the head and tail of audio clips.
+
+        Writes a clip automation envelope on the track's Mixer Volume that ramps
+        from silence up to the track's current volume over `fade_ms`, holds, then
+        ramps back to silence over `fade_ms` at the clip end - the programmatic
+        equivalent of a short declick fade (Logic-style "just engaged").
+
+        track_index < 0 targets the currently selected track. clip_index < 0 targets
+        every audio clip on the track; otherwise only that arrangement clip.
+        action is "apply", "inspect" (read-only) or "clear".
+        """
+        try:
+            # Resolve the track (selected track when track_index < 0).
+            if track_index is None or track_index < 0:
+                track = self._song.view.selected_track
+                try:
+                    track_index = list(self._song.tracks).index(track)
+                except ValueError:
+                    raise ValueError("Selected track is not a regular track (return/master unsupported)")
+            else:
+                if track_index >= len(self._song.tracks):
+                    raise IndexError("Track index {0} out of range".format(track_index))
+                track = self._song.tracks[track_index]
+
+            vol_param = track.mixer_device.volume
+            unity = vol_param.value
+            tempo = self._song.tempo
+            fade_beats = (float(fade_ms) / 1000.0) * (tempo / 60.0)
+            steps = max(1, int(steps))
+
+            results = []
+            for ci, clip in enumerate(track.arrangement_clips):
+                if clip_index is not None and clip_index >= 0 and ci != clip_index:
+                    continue
+                if not clip.is_audio_clip:
+                    continue
+
+                # Clip-envelope time runs 0..length (beats) from the clip start.
+                span = clip.length
+                fb = fade_beats
+                if span > 0 and fb > span / 2.0:
+                    fb = span / 2.0
+
+                if action == "inspect":
+                    env = clip.automation_envelope(vol_param)
+                    samples = None
+                    if env is not None:
+                        samples = [[round(t, 5), round(env.value_at_time(t), 4)]
+                                   for t in self._fade_probe_times(span, fb)]
+                    results.append({
+                        "clip_index": ci, "name": clip.name, "length": span,
+                        "start_marker": clip.start_marker, "end_marker": clip.end_marker,
+                        "unity": round(unity, 4), "fade_beats": round(fb, 5),
+                        "has_env": env is not None, "samples": samples,
+                    })
+                    continue
+
+                if action == "clear":
+                    clip.clear_envelope(vol_param)
+                    results.append({"clip_index": ci, "name": clip.name, "cleared": True})
+                    continue
+
+                # action == "apply": (re)build the two edge ramps.
+                env = clip.create_automation_envelope(vol_param)
+                env.clear_range(0.0, fb)
+                env.clear_range(span - fb, span)
+                for i in range(steps + 1):
+                    frac = i / float(steps)
+                    env.insert_step(frac * fb, 0.0, unity * frac)
+                for i in range(steps + 1):
+                    frac = i / float(steps)
+                    env.insert_step(span - fb + frac * fb, 0.0, unity * (1.0 - frac))
+                samples = [[round(t, 5), round(env.value_at_time(t), 4)]
+                           for t in self._fade_probe_times(span, fb)]
+                results.append({
+                    "clip_index": ci, "name": clip.name,
+                    "unity": round(unity, 4), "fade_beats": round(fb, 5), "samples": samples,
+                })
+
+            return {
+                "track_index": track_index, "track_name": track.name, "action": action,
+                "fade_ms": fade_ms, "steps": steps, "tempo": tempo,
+                "audio_clips": len(results), "clips": results,
+            }
+        except Exception as e:
+            self.log_message("Error fading clip edges: " + str(e))
+            raise
+
+    def _fade_probe_times(self, span, fb):
+        """Sample times across the head fade, body and tail fade, for shape verification."""
+        if fb <= 0:
+            fb = max(span * 0.01, 0.001)
+        times = [f * fb for f in (0.0, 0.25, 0.5, 0.75, 1.0)]
+        times.append(span / 2.0)
+        times += [span - fb + f * fb for f in (0.0, 0.25, 0.5, 0.75, 1.0)]
+        return times
 
     # ── Device command handlers ──────────────────────────────────────
 
